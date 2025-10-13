@@ -1,0 +1,46 @@
+[profile.default]
+src = "contracts"
+test = "contract-tests"
+out = "out"
+libs = ["lib"]
+remappings = [
+    "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"
+]
+optimizer = true
+optimizer_runs = 1000000
+
+# Cancun compatibility settings
+solc_version = "0.8.24"
+evm_version = "cancun"
+via_ir = true
+
+# Enable Cancun-specific optimizations
+[profile.default.optimizer_details]
+constantOptimizer = true
+yul = true
+
+[profile.default.optimizer_details.yulDetails]
+stackAllocation = true
+optimizerSteps = "dhfoDgvulfnTUtnIf:fDnTOc"
+
+# Network-specific profiles for different EVM versions
+[profile.mainnet]
+evm_version = "cancun"
+
+[profile.arbitrum]
+evm_version = "cancun"
+
+[profile.optimism]
+evm_version = "cancun"
+
+[profile.polygon]
+evm_version = "cancun"
+
+[profile.base]
+evm_version = "cancun"
+
+[profile.legacy]
+evm_version = "shanghai"
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
