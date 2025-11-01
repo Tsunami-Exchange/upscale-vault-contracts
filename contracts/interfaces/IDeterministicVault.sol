@@ -16,7 +16,6 @@ interface IDeterministicVault {
     event Swept(bytes32 indexed paymentId, address wallet, address indexed token, uint256 nativeAmt, uint256 tokenAmt);
     event Withdrawn(address indexed to, address indexed token, uint256 amount, uint256 nonce);
     event DirectWithdraw(address indexed signer, address indexed beneficiary, address indexed token, uint256 amount);
-    event AdminCall(address indexed to, uint256 value, bytes data, bytes result);
     event AdminTransfer(address indexed token, address indexed to, uint256 amount);
 
     /**
@@ -27,6 +26,15 @@ interface IDeterministicVault {
     function walletAddressFromUuid(string calldata uuid) external view returns (address);
     function sweep(bytes32 paymentId, address token, address payer) external returns (address wallet);
     function payDirect(bytes32 paymentId, address token, uint256 amount) external payable;
+    function payDirectWithPermit(
+        bytes32 paymentId,
+        address token,
+        uint256 amount,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
 
     /**
      * @dev Configuration functions
@@ -58,7 +66,6 @@ interface IDeterministicVault {
      * @dev Admin functions
      */
     function adminTransfer(address token, address to, uint256 amount) external;
-    function adminCall(address to, uint256 value, bytes calldata data) external returns (bytes memory);
 
     /**
      * @dev User withdrawal functions

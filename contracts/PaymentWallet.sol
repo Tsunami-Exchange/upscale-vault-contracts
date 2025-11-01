@@ -26,7 +26,15 @@ contract PaymentWallet is Initializable {
         FACTORY = factory_;
     }
 
-    function drainToVault(
+    /**
+     * @dev Sweeps tokens and ETH from this wallet to the vault
+     * @notice This function transfers all tokens of the specified type and all ETH to the vault
+     * @param paymentId The payment ID associated with this wallet
+     * @param payer The payer address for attribution
+     * @param vault The vault address to sweep funds to
+     * @param token The token address to sweep (address(0) to skip token sweep, only ETH)
+     */
+    function sweepToVault(
         bytes32 paymentId,
         address payer,
         address payable vault,

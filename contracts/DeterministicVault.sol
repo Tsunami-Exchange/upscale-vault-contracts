@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -46,7 +47,12 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
     // Gas optimization: Pre-compute init code hash for CREATE2
     bytes32 private _INIT_CODE_HASH;
 
-    constructor() {}
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        // Prevent the implementation contract from being initialized directly.
+        // See OpenZeppelin upgrades: lock the implementation.
+        _disableInitializers();
+    }
 
     /**
      * @dev Initializer function (replaces constructor)
@@ -133,6 +139,11 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
         address predicted = walletAddress(paymentId);
         if (predicted.code.length > 0) return predicted; // already deployed
         
+        // Sanity: ensure cached init code hash matches current creationCode; this prevents silent mismatches.
+        // If PaymentWallet bytecode changed without updating _INIT_CODE_HASH, fail early.
+        bytes32 currentHash = OptimizedHashing.hashBytes(_initCode());
+        require(_INIT_CODE_HASH == currentHash, "INIT_CODE_HASH_MISMATCH");
+        
         // Gas optimization: Generate init code efficiently
         bytes memory code = _initCode();
         assembly {
@@ -165,6 +176,8 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
 
     /**
      * @dev Direct payment to the vault (push payment)
+     * @notice For ERC20 tokens, requires exact-amount approval. Do not approve MAX_UINT256.
+     * @notice The approved amount must exactly match the `amount` parameter (respecting token decimals).
      * @param paymentId The payment ID to credit
      * @param token The token address (address(0) for ETH)
      * @param amount The token amount (for ETH, must match msg.value)
@@ -189,6 +202,12 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             require(amount > 0, "ZERO_AMOUNT");
             require(tokenWhitelist[token], "TOKEN_NOT_WHITELISTED");
             
+            // Enforce exact-amount approval to prevent MAX_UINT256 approvals
+            // This reduces Blockaid warnings by ensuring users only approve what they intend to pay
+            uint256 allowance = IERC20(token).allowance(msg.sender, address(this));
+            require(allowance >= amount, "INSUFFICIENT_ALLOWANCE");
+            require(allowance <= amount, "EXCESSIVE_ALLOWANCE"); // Reject MAX_UINT256-style approvals
+            
             // Transfer tokens from sender to vault
             IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
             
@@ -198,6 +217,52 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             emit DirectPayment(paymentId, msg.sender, token, amount);
             emit Deposited(paymentId, msg.sender, token, amount);
         }
+    }
+
+    /**
+     * @dev Direct payment to the vault using EIP-2612 permit (gasless approval)
+     * @notice This function allows payment without a separate approval transaction.
+     * @notice The permit signature must be signed by the owner of the tokens.
+     * @notice Token must support EIP-2612 permit functionality.
+     * @param paymentId The payment ID to credit
+     * @param token The token address (must support permit, cannot be address(0))
+     * @param amount The token amount to transfer
+     * @param deadline The deadline for the permit signature
+     * @param v The recovery byte of the permit signature
+     * @param r The r component of the permit signature
+     * @param s The s component of the permit signature
+     */
+    function payDirectWithPermit(
+        bytes32 paymentId,
+        address token,
+        uint256 amount,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external nonReentrant {
+        require(paymentId != bytes32(0), "ZERO_PAYMENT_ID");
+        require(token != address(0), "TOKEN_0_FORBIDDEN");
+        require(amount > 0, "ZERO_AMOUNT");
+        require(tokenWhitelist[token], "TOKEN_NOT_WHITELISTED");
+        require(block.timestamp <= deadline, "PERMIT_EXPIRED");
+
+        // Use try-catch for permit to handle tokens that don't support it gracefully
+        // Following OpenZeppelin's recommended pattern for permit usage
+        try IERC20Permit(token).permit(msg.sender, address(this), amount, deadline, v, r, s) {
+            // Permit succeeded, proceed with transfer
+        } catch {
+            revert("PERMIT_FAILED");
+        }
+
+        // Transfer tokens from sender to vault using the permit approval
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        
+        totalBalances[token] += amount;
+        byPayment[paymentId][token] += amount;
+        
+        emit DirectPayment(paymentId, msg.sender, token, amount);
+        emit Deposited(paymentId, msg.sender, token, amount);
     }
 
     /* --------------------- Admin config --------------------- */
@@ -235,15 +300,15 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
      */
     function _initiateLazySweep(bytes32 paymentId, address payer, address token) internal {
         address wallet = walletAddress(paymentId);
-        // Call wallet to drain into us; the wallet will callback `onLazySweep`
-        PaymentWallet(payable(wallet)).drainToVault(paymentId, payer, payable(address(this)), token);
+        // Call wallet to sweep funds into us; the wallet will callback `onLazySweep`
+        PaymentWallet(payable(wallet)).sweepToVault(paymentId, payer, payable(address(this)), token);
     }
 
     /**
      * @dev Callback from the wallet after it has transferred ERC20 and is forwarding ETH.
      * Accounts balances per token and per paymentId.
      * @param paymentId The payment ID
-     * @param payer The payer address
+     * @param payer The payer address   
      * @param token The token address
      * @param tokenAmount The token amount transferred
      */
@@ -270,14 +335,14 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             emit Deposited(paymentId, payer, zeroAddr, nativeAmt);
         }
 
-        // Gas optimization: Check whitelist status once and cache zero comparison
+        // Prevent silent acceptance of tokens that are not whitelisted.
+        // If a token is not whitelisted, fail early so the PaymentWallet's
+        // sweep does not succeed in transferring untracked tokens.
         if (token != address(0) && tokenAmount > 0) {
-            bool isWhitelisted = tokenWhitelist[token];
-            if (isWhitelisted) {
-                totalBalances[token] += tokenAmount;
-                byPayment[paymentId][token] += tokenAmount;
-                emit Deposited(paymentId, payer, token, tokenAmount);
-            }
+            require(tokenWhitelist[token], "TOKEN_NOT_WHITELISTED_ON_SWEEP");
+            totalBalances[token] += tokenAmount;
+            byPayment[paymentId][token] += tokenAmount;
+            emit Deposited(paymentId, payer, token, tokenAmount);
         }
 
         emit Swept(paymentId, wallet, token, nativeAmt, tokenAmount);
@@ -287,6 +352,8 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
 
     /**
      * @dev Admin function to transfer tokens/ETH from the vault
+     * @notice This is an administrative function for emergency fund recovery or authorized transfers.
+     * @notice All admin transfers are tracked and emit events for transparency.
      * @param token The token address (address(0) for ETH)
      * @param to The recipient address
      * @param amount The amount to transfer
@@ -306,26 +373,6 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             IERC20(token).safeTransfer(to, amount);
         }
         emit AdminTransfer(token, to, amount);
-    }
-
-    /**
-     * @dev Admin function to make arbitrary calls
-     * @param to The target address
-     * @param value The ETH value to send
-     * @param data The call data
-     * @return result The call result
-     */
-    function adminCall(address to, uint256 value, bytes calldata data)
-        external
-        onlyOwner
-        nonReentrant
-        returns (bytes memory result)
-    {
-        require(to != address(0), "ZERO_TO");
-        (bool ok, bytes memory ret) = to.call{value: value}(data);
-        require(ok, "ADMIN_CALL_FAIL");
-        emit AdminCall(to, value, data, ret);
-        return ret;
     }
 
     /* --------------------- User withdrawals via signed intent --------------------- */
@@ -394,13 +441,16 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
     }
 
     /**
-     * @dev Direct withdrawal by intent signer (no signature required)
+     * @dev Direct withdrawal by owner (multisig/timelock recommended)
+     * @notice This function allows the owner to withdraw funds directly without signatures.
+     * @notice WARNING: Requires owner (multisig/timelock recommended). Do not grant single EOA direct withdrawal power.
+     * @notice The intentSigner should only sign off-chain intents; actual withdrawals should go through owner/multisig.
      * @param beneficiary The beneficiary address
      * @param token The token address (address(0) for ETH)
      * @param amount The amount to withdraw
      */
-    function withdrawDirect(address beneficiary, address token, uint256 amount) external nonReentrant {
-        require(msg.sender == intentSigner, "ONLY_INTENT_SIGNER");
+    function withdrawDirect(address beneficiary, address token, uint256 amount) external onlyOwner nonReentrant {
+        // msg.sender is owner (multisig/timelock recommended)
         require(beneficiary != address(0), "ZERO_BENEF");
         require(amount > 0, "ZERO_AMOUNT");
         

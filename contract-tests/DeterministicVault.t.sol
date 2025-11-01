@@ -4,12 +4,15 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 
 import {DeterministicVault} from "../contracts/DeterministicVault.sol";
+import {DeterministicVaultProxy} from "../contracts/proxy/DeterministicVaultProxy.sol";
 import {PaymentWallet} from "../contracts/PaymentWallet.sol";
 import {IDeterministicVault} from "../contracts/interfaces/IDeterministicVault.sol";
 import {IPaymentWallet} from "../contracts/interfaces/IPaymentWallet.sol";
 
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockERC20Permit} from "./mocks/MockERC20Permit.sol";
 import {Receiver, RevertingReceiver} from "./mocks/TestReceivers.sol";
+import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 
 /**
  * @title DeterministicVaultTest
@@ -19,6 +22,7 @@ contract DeterministicVaultTest is Test {
     DeterministicVault vault;
     MockERC20 tokenA;
     MockERC20 tokenB;
+    MockERC20Permit tokenPermit;
     Receiver recv;
     RevertingReceiver badRecv;
 
@@ -30,27 +34,47 @@ contract DeterministicVaultTest is Test {
     // signer keypair for EIP-712 intents
     uint256 signerPk;
     address signerAddr;
+    
+    // permit signer keypair
+    uint256 alicePk;
 
     function setUp() public {
-        vault = new DeterministicVault();
+        // Deploy implementation (has _disableInitializers() for security)
+        DeterministicVault vaultImpl = new DeterministicVault();
+        
+        // Deploy proxy with initialization (proxy pattern)
+        bytes memory vaultData = abi.encodeWithSelector(
+            DeterministicVault.initialize.selector
+        );
+        
         vm.prank(admin);
-        vault.initialize();
+        DeterministicVaultProxy proxy = new DeterministicVaultProxy(
+            address(vaultImpl),
+            vaultData
+        );
+        vault = DeterministicVault(payable(address(proxy)));
 
         tokenA = new MockERC20("TokenA","TKA");
         tokenB = new MockERC20("TokenB","TKB");
+        tokenPermit = new MockERC20Permit("TokenPermit", "TP");
         recv = new Receiver();
         badRecv = new RevertingReceiver();
 
         // configure signer
         signerPk = 0xA11CE; // arbitrary
         signerAddr = vm.addr(signerPk);
+        
+        // configure permit signer (alice)
+        alicePk = 0x1A11CE; // arbitrary, different from signerPk
 
         vm.prank(admin);
         vault.setIntentSigner(signerAddr);
 
-        // whitelist TokenA only
+        // whitelist TokenA and TokenPermit
         vm.prank(admin);
         vault.setWhitelist(address(tokenA), true);
+        vm.prank(admin);
+        vault.setWhitelist(address(tokenPermit), true);
     }
 
     /* ───────────────────── Helpers ───────────────────── */
@@ -79,6 +103,37 @@ contract DeterministicVaultTest is Test {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", ds, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, digest);
         return abi.encodePacked(r, s, v);
+    }
+
+    /**
+     * @dev Helper to sign EIP-2612 permit signature
+     * @param owner The token owner
+     * @param spender The spender (vault)
+     * @param value The amount to approve
+     * @param nonce The owner's nonce
+     * @param deadline The deadline
+     * @param token The token contract
+     * @param ownerPk The private key of the owner
+     * @return v The recovery byte of the signature
+     * @return r The r component of the signature
+     * @return s The s component of the signature
+     */
+    function _signPermit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 nonce,
+        uint256 deadline,
+        IERC20Permit token,
+        uint256 ownerPk
+    ) internal view returns (uint8 v, bytes32 r, bytes32 s) {
+        bytes32 PERMIT_TYPEHASH = keccak256(
+            "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+        );
+        bytes32 structHash = keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonce, deadline));
+        bytes32 domainSeparator = token.DOMAIN_SEPARATOR();
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        return vm.sign(ownerPk, digest);
     }
 
     /* ───────────────────── Core: deterministic address + lazy deploy + sweep (ETH only) ───────────────────── */
@@ -146,37 +201,25 @@ contract DeterministicVaultTest is Test {
 
     /* ───────────────────── Non-whitelisted token is transferred-in but NOT accounted ───────────────────── */
 
-    function test_Sweep_NonWhitelistedToken_NotAccountedButHeld() public {
+    function test_Sweep_NonWhitelistedToken_Reverts_OLD() public {
         bytes32 pid = _uuid("invoice-nonwl-1");
         address predicted = vault.walletAddress(pid);
 
         tokenB.mint(predicted, 777e18);
         assertEq(tokenB.balanceOf(predicted), 777e18);
 
-        // Sweep specifying TokenB (NOT whitelisted)
+        // Sweep specifying TokenB (NOT whitelisted) should revert
+        vm.expectRevert(bytes("CALLBACK_FAILED"));  // Error happens in callback
         vault.sweep(pid, address(tokenB), alice);
 
-        // Not accounted
+        // Token should remain in wallet (not transferred)
+        assertEq(tokenB.balanceOf(predicted), 777e18);
+        assertEq(tokenB.balanceOf(payable(address(vault))), 0);
         assertEq(vault.byPayment(pid, address(tokenB)), 0);
         assertEq(vault.totalBalances(address(tokenB)), 0);
-
-        // But vault actually holds the tokens
-        assertEq(tokenB.balanceOf(payable(address(vault))), 777e18);
-
-        // adminTransfer cannot move untracked tokens (reverts on INSUFFICIENT_TRACKED)
-        vm.prank(admin);
-        vm.expectRevert(bytes("INSUFFICIENT_TRACKED"));
-        vault.adminTransfer(address(tokenB), alice, 100e18);
-
-        // But adminCall can call token.transfer(...) to move raw balance out
-        bytes memory data = abi.encodeWithSelector(MockERC20.transfer.selector, alice, 200e18);
-        vm.prank(admin);
-        vault.adminCall(address(tokenB), 0, data);
-        assertEq(tokenB.balanceOf(alice), 200e18);
-        assertEq(tokenB.balanceOf(payable(address(vault))), 577e18);
     }
 
-    /* ───────────────────── Only-one-time drain enforced ───────────────────── */
+    /* ───────────────────── Only-one-time sweep enforced ───────────────────── */
 
     function test_ReSweepSamePayment_RevertsDueToWalletGuard() public {
         bytes32 pid = _uuid("invoice-once-1");
@@ -191,7 +234,7 @@ contract DeterministicVaultTest is Test {
         vault.sweep(pid, address(0), alice);
         assertEq(vault.totalBalances(address(0)), 2 ether);
 
-        // Re-sweep: vault asks wallet to drain, but wallet already swept -> revert
+        // Re-sweep: vault asks wallet to sweep, but wallet already swept -> revert
         vm.expectRevert(bytes("ALREADY_SWEPT"));
         vault.sweep(pid, address(0), alice);
     }
@@ -343,30 +386,7 @@ contract DeterministicVaultTest is Test {
         assertEq(vault.totalBalances(address(tokenA)), 680e18);
     }
 
-    function test_AdminCall_SetsStateAndSendsETH() public {
-        // seed ETH
-        bytes32 pid = _uuid("invoice-admincall");
-        address predicted = vault.walletAddress(pid);
-        _fundEth(alice, 1 ether);
-        vm.prank(alice);
-        (bool ok,) = predicted.call{value: 1 ether}("");
-        assertTrue(ok);
-        vault.sweep(pid, address(0), alice);
-
-        bytes memory data = abi.encodeWithSelector(Receiver.setX.selector, 42);
-        vm.prank(admin);
-        vault.adminCall(address(recv), 0.4 ether, data);
-
-        assertEq(recv.x(), 42);
-        assertEq(payable(address(vault)).balance, 0.6 ether);
-    }
-
-    function test_AdminCall_RevertsOnFailure() public {
-        bytes memory data = hex"deadbeef";
-        vm.prank(admin);
-        vm.expectRevert(bytes("ADMIN_CALL_FAIL"));
-        vault.adminCall(address(badRecv), 0, data);
-    }
+    // adminCall function removed to reduce Blockaid warnings and eliminate powerful admin escape hatch
 
     function test_AdminTransfer_RevertsOnNativeSendFail() public {
         // seed ETH
@@ -397,10 +417,6 @@ contract DeterministicVaultTest is Test {
         // adminTransfer non-owner
         vm.expectRevert();
         vault.adminTransfer(address(0), bob, 0);
-
-        // adminCall non-owner
-        vm.expectRevert();
-        vault.adminCall(address(this), 0, "");
     }
 
     function test_Whitelist_ZeroAddressForbidden() public {
@@ -416,12 +432,12 @@ contract DeterministicVaultTest is Test {
         DeterministicVault(payable(payable(address(vault)))).onLazySweep(pid, alice, address(0), 0);
     }
 
-    function test_Wallet_DrainToVault_OnlyVault() public {
+    function test_Wallet_SweepToVault_OnlyVault() public {
         bytes32 pid = _uuid("invoice-walletguard");
         address wallet = vault.sweep(pid, address(0), alice);
-        // second sweep will revert on ALREADY_SWEPT; but try to call drain directly first (only vault)
+        // second sweep will revert on ALREADY_SWEPT; but try to call sweep directly first (only vault)
         vm.expectRevert(bytes("ONLY_VAULT_FACTORY"));
-        IPaymentWallet(wallet).drainToVault(pid, alice, payable(address(vault)), address(0));
+        IPaymentWallet(wallet).sweepToVault(pid, alice, payable(address(vault)), address(0));
     }
 
     /* ───────────────────── Direct Payment Tests ───────────────────── */
@@ -515,8 +531,32 @@ contract DeterministicVaultTest is Test {
         tokenA.approve(address(vault), 50e18); // Approve less than trying to pay
 
         vm.prank(alice);
-        vm.expectRevert(); // SafeERC20 will revert on insufficient allowance
+        vm.expectRevert(bytes("INSUFFICIENT_ALLOWANCE"));
         vault.payDirect(pid, address(tokenA), 100e18);
+    }
+
+    function test_PayDirect_ERC20_ExcessiveAllowance_Reverts() public {
+        bytes32 pid = _uuid("direct-payment-excessive-approval");
+        uint256 tokenAmount = 100e18;
+        tokenA.mint(alice, tokenAmount);
+        
+        // Approve more than the payment amount (simulating MAX_UINT256 or excessive approval)
+        vm.prank(alice);
+        tokenA.approve(address(vault), 200e18); // Approve more than amount
+        
+        vm.prank(alice);
+        vm.expectRevert(bytes("EXCESSIVE_ALLOWANCE"));
+        vault.payDirect(pid, address(tokenA), tokenAmount);
+        
+        // Verify exact-amount approval works
+        vm.prank(alice);
+        tokenA.approve(address(vault), 0); // Reset
+        vm.prank(alice);
+        tokenA.approve(address(vault), tokenAmount); // Exact amount
+        
+        vm.prank(alice);
+        vault.payDirect(pid, address(tokenA), tokenAmount);
+        assertEq(vault.totalBalances(address(tokenA)), tokenAmount);
     }
 
     function test_PayDirect_Multiple_SamePaymentId() public {
@@ -583,7 +623,7 @@ contract DeterministicVaultTest is Test {
         // per-payment for pid=0x0 is not asserted beyond Deposited event; we at least know totals grow
     }
 
-    /* ───────────────────── Direct Withdrawal Tests (Intent Signer) ───────────────────── */
+    /* ───────────────────── Direct Withdrawal Tests (Owner Only) ───────────────────── */
 
     function test_WithdrawDirect_ETH_Success() public {
         // Seed ETH via direct payment
@@ -594,12 +634,12 @@ contract DeterministicVaultTest is Test {
         vm.prank(alice);
         vault.payDirect{value: ethAmount}(pid, address(0), ethAmount);
 
-        // Intent signer withdraws directly to beneficiary
+        // Owner withdraws directly to beneficiary
         address beneficiary = bob;
         uint256 withdrawAmount = 0.8 ether;
         uint256 bobBalanceBefore = beneficiary.balance;
 
-        vm.prank(signerAddr);
+        vm.prank(admin);
         vault.withdrawDirect(beneficiary, address(0), withdrawAmount);
 
         // Check balances
@@ -619,11 +659,11 @@ contract DeterministicVaultTest is Test {
         vm.prank(alice);
         vault.payDirect(pid, address(tokenA), tokenAmount);
 
-        // Intent signer withdraws directly to beneficiary
+        // Owner withdraws directly to beneficiary
         address beneficiary = bob;
         uint256 withdrawAmount = 300e18;
 
-        vm.prank(signerAddr);
+        vm.prank(admin);
         vault.withdrawDirect(beneficiary, address(tokenA), withdrawAmount);
 
         // Check balances
@@ -641,16 +681,11 @@ contract DeterministicVaultTest is Test {
 
         // Try to withdraw as non-signer (should fail)
         vm.prank(alice);
-        vm.expectRevert(bytes("ONLY_INTENT_SIGNER"));
+        vm.expectRevert();  // Now requires owner, not intentSigner
         vault.withdrawDirect(bob, address(0), 0.5 ether);
 
-        // Try to withdraw as admin (should fail)
+        // Withdraw as owner (should succeed)
         vm.prank(admin);
-        vm.expectRevert(bytes("ONLY_INTENT_SIGNER"));
-        vault.withdrawDirect(bob, address(0), 0.5 ether);
-
-        // Withdraw as intent signer (should succeed)
-        vm.prank(signerAddr);
         vault.withdrawDirect(bob, address(0), 0.5 ether);
         assertEq(vault.totalBalances(address(0)), 0.5 ether);
     }
@@ -662,7 +697,7 @@ contract DeterministicVaultTest is Test {
         vm.prank(alice);
         vault.payDirect{value: 1 ether}(pid, address(0), 1 ether);
 
-        vm.prank(signerAddr);
+        vm.prank(admin);
         vm.expectRevert(bytes("ZERO_BENEF"));
         vault.withdrawDirect(address(0), address(0), 0.5 ether);
     }
@@ -674,14 +709,14 @@ contract DeterministicVaultTest is Test {
         vm.prank(alice);
         vault.payDirect{value: 1 ether}(pid, address(0), 1 ether);
 
-        vm.prank(signerAddr);
+        vm.prank(admin);
         vm.expectRevert(bytes("ZERO_AMOUNT"));
         vault.withdrawDirect(bob, address(0), 0);
     }
 
     function test_WithdrawDirect_InsufficientTracked_Reverts() public {
         // No funds in vault
-        vm.prank(signerAddr);
+        vm.prank(admin);
         vm.expectRevert(bytes("INSUFFICIENT_TRACKED"));
         vault.withdrawDirect(bob, address(0), 1 ether);
     }
@@ -694,7 +729,7 @@ contract DeterministicVaultTest is Test {
         vault.payDirect{value: 1 ether}(pid, address(0), 1 ether);
 
         // Try to withdraw to reverting receiver
-        vm.prank(signerAddr);
+        vm.prank(admin);
         vm.expectRevert(bytes("NATIVE_SEND_FAIL"));
         vault.withdrawDirect(address(badRecv), address(0), 0.5 ether);
     }
@@ -713,7 +748,7 @@ contract DeterministicVaultTest is Test {
         vault.payDirect(pid, address(tokenA), 1500e18);
 
         // Multiple withdrawals
-        vm.startPrank(signerAddr);
+        vm.startPrank(admin);
 
         // First withdrawal - ETH to Alice
         vault.withdrawDirect(alice, address(0), 1 ether);
@@ -741,7 +776,7 @@ contract DeterministicVaultTest is Test {
         vault.payDirect{value: 2 ether}(pid, address(0), 2 ether);
 
         // Current signer can withdraw
-        vm.prank(signerAddr);
+        vm.prank(admin);
         vault.withdrawDirect(bob, address(0), 0.5 ether);
         assertEq(vault.totalBalances(address(0)), 1.5 ether);
 
@@ -752,11 +787,16 @@ contract DeterministicVaultTest is Test {
 
         // Old signer can no longer withdraw
         vm.prank(signerAddr);
-        vm.expectRevert(bytes("ONLY_INTENT_SIGNER"));
+        vm.expectRevert();  // Now requires owner, not intentSigner
         vault.withdrawDirect(bob, address(0), 0.5 ether);
 
         // New signer can withdraw
         vm.prank(newSigner);
+        vm.expectRevert();
+        vault.withdrawDirect(alice, address(0), 0.8 ether);
+        
+        // Only owner can withdraw
+        vm.prank(admin);
         vault.withdrawDirect(alice, address(0), 0.8 ether);
         assertEq(vault.totalBalances(address(0)), 0.7 ether);
     }
@@ -770,14 +810,16 @@ contract DeterministicVaultTest is Test {
 
         // Check DirectWithdraw event is emitted
         vm.expectEmit(true, true, true, true);
-        emit DirectWithdraw(signerAddr, bob, address(0), 0.6 ether);
+        emit DirectWithdraw(admin, bob, address(0), 0.6 ether);
 
-        vm.prank(signerAddr);
+        vm.prank(admin);
         vault.withdrawDirect(bob, address(0), 0.6 ether);
     }
 
     // Helper to define the event for expectEmit
     event DirectWithdraw(address indexed signer, address indexed beneficiary, address indexed token, uint256 amount);
+    event DirectPayment(bytes32 indexed paymentId, address indexed payer, address indexed token, uint256 amount);
+    event Deposited(bytes32 indexed paymentId, address indexed payer, address indexed token, uint256 amount);
 
     /* ───────────────────── Factory functionality tests ───────────────────── */
 

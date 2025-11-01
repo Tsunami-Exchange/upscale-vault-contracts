@@ -127,8 +127,8 @@ contract UpgradeableVaultTest is Test {
         vaultProxy.payDirect(paymentId, address(token), amount);
         vm.stopPrank();
 
-        // Direct withdraw by intent signer
-        vm.prank(intentSigner);
+        // Direct withdraw by owner (intentSigner no longer has permission)
+        vm.prank(owner);
         vaultProxy.withdrawDirect(user, address(token), amount);
 
         assertEq(vaultProxy.totalBalances(address(token)), 0);

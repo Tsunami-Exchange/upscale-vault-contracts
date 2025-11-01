@@ -20,7 +20,7 @@ interface IPaymentWalletV1 {
     /**
      * @dev Core functionality
      */
-    function drainToVault(
+    function sweepToVault(
         bytes32 paymentId,
         address payer,
         address payable vault,

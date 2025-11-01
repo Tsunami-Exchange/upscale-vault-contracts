@@ -19,13 +19,13 @@ interface IPaymentWallet {
     function swept() external view returns (bool);
 
     /**
-     * @dev Drains the wallet to the vault
+     * @dev Sweeps tokens and ETH from the wallet to the vault
      * @param paymentId The payment ID
      * @param payer The payer address
      * @param vault The vault address
-     * @param token The token to drain
+     * @param token The token to sweep (address(0) to skip token sweep, only ETH)
      */
-    function drainToVault(
+    function sweepToVault(
         bytes32 paymentId,
         address payer,
         address payable vault,
