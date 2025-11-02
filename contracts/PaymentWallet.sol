@@ -61,7 +61,7 @@ contract PaymentWallet is Initializable {
             token,
             tokenAmt
         );
-        
+
         (bool success,) = vault.call{value: ethBalance}(callData);
         require(success, "CALLBACK_FAILED");
     }

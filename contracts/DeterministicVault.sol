@@ -43,7 +43,7 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
         keccak256("WithdrawIntent(address beneficiary,address token,uint256 amount,uint256 nonce,uint256 deadline)");
     bytes32 private constant _NAME_HASH = keccak256(bytes("DeterministicVault"));
     bytes32 private constant _VERSION_HASH = keccak256(bytes("1"));
-    
+
     // Gas optimization: Pre-compute init code hash for CREATE2
     bytes32 private _INIT_CODE_HASH;
 
@@ -69,7 +69,7 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             block.chainid,
             address(this)
         ));
-        
+
         // Pre-compute init code hash for gas optimization
         bytes memory initCode = type(PaymentWallet).creationCode;
         _INIT_CODE_HASH = OptimizedHashing.hashBytes(initCode);
@@ -101,7 +101,7 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
     function _initCode() internal pure returns (bytes memory) {
         return type(PaymentWallet).creationCode;
     }
-    
+
     /**
      * @dev Returns the pre-computed init code hash (gas optimized)
      * @return The init code hash
@@ -138,12 +138,12 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
     function _deploy(bytes32 paymentId) internal returns (address w) {
         address predicted = walletAddress(paymentId);
         if (predicted.code.length > 0) return predicted; // already deployed
-        
+
         // Sanity: ensure cached init code hash matches current creationCode; this prevents silent mismatches.
         // If PaymentWallet bytecode changed without updating _INIT_CODE_HASH, fail early.
         bytes32 currentHash = OptimizedHashing.hashBytes(_initCode());
         require(_INIT_CODE_HASH == currentHash, "INIT_CODE_HASH_MISMATCH");
-        
+
         // Gas optimization: Generate init code efficiently
         bytes memory code = _initCode();
         assembly {
@@ -184,16 +184,16 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
      */
     function payDirect(bytes32 paymentId, address token, uint256 amount) external payable {
         require(paymentId != bytes32(0), "ZERO_PAYMENT_ID");
-        
+
         if (token == address(0)) {
             // ETH payment
             uint256 ethValue = msg.value; // Gas optimization: cache msg.value
             require(ethValue > 0, "NO_ETH_SENT");
             require(amount == ethValue, "ETH_AMOUNT_MISMATCH");
-            
+
             totalBalances[address(0)] += ethValue;
             byPayment[paymentId][address(0)] += ethValue;
-            
+
             emit DirectPayment(paymentId, msg.sender, address(0), ethValue);
             emit Deposited(paymentId, msg.sender, address(0), ethValue);
         } else {
@@ -201,19 +201,19 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             require(msg.value == 0, "NO_ETH_FOR_TOKEN_PAYMENT");
             require(amount > 0, "ZERO_AMOUNT");
             require(tokenWhitelist[token], "TOKEN_NOT_WHITELISTED");
-            
+
             // Enforce exact-amount approval to prevent MAX_UINT256 approvals
             // This reduces Blockaid warnings by ensuring users only approve what they intend to pay
             uint256 allowance = IERC20(token).allowance(msg.sender, address(this));
             require(allowance >= amount, "INSUFFICIENT_ALLOWANCE");
             require(allowance <= amount, "EXCESSIVE_ALLOWANCE"); // Reject MAX_UINT256-style approvals
-            
+
             // Transfer tokens from sender to vault
             IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-            
+
             totalBalances[token] += amount;
             byPayment[paymentId][token] += amount;
-            
+
             emit DirectPayment(paymentId, msg.sender, token, amount);
             emit Deposited(paymentId, msg.sender, token, amount);
         }
@@ -257,10 +257,10 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
 
         // Transfer tokens from sender to vault using the permit approval
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        
+
         totalBalances[token] += amount;
         byPayment[paymentId][token] += amount;
-        
+
         emit DirectPayment(paymentId, msg.sender, token, amount);
         emit Deposited(paymentId, msg.sender, token, amount);
     }
@@ -308,7 +308,7 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
      * @dev Callback from the wallet after it has transferred ERC20 and is forwarding ETH.
      * Accounts balances per token and per paymentId.
      * @param paymentId The payment ID
-     * @param payer The payer address   
+     * @param payer The payer address
      * @param token The token address
      * @param tokenAmount The token amount transferred
      */
@@ -321,7 +321,7 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
         // Cancun optimization: Use transient storage for temp values
         uint256 nativeAmt = msg.value;
         address wallet = msg.sender;
-        
+
         // Store in transient storage for potential reuse in same transaction
         TransientStorage.TEMP_ADDRESS_SLOT.setAddress(wallet);
         TransientStorage.TEMP_AMOUNT_SLOT.setUint256(nativeAmt);
@@ -360,12 +360,12 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
      */
     function adminTransfer(address token, address to, uint256 amount) external onlyOwner nonReentrant {
         require(to != address(0), "ZERO_TO");
-        
+
         // Gas optimization: Cache storage read
         uint256 currentBalance = totalBalances[token];
         require(currentBalance >= amount, "INSUFFICIENT_TRACKED");
         totalBalances[token] = currentBalance - amount;
-        
+
         if (token == address(0)) {
             (bool ok, ) = to.call{value: amount}("");
             require(ok, "NATIVE_SEND_FAIL");
@@ -409,7 +409,7 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
     ) external nonReentrant {
         require(beneficiary != address(0), "ZERO_BENEF");
         require(block.timestamp <= deadline, "EXPIRED");
-        
+
         // Gas optimization: Cache storage reads
         uint256 nonce = nonces[beneficiary];
         address signer = intentSigner;
@@ -453,7 +453,7 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
         // msg.sender is owner (multisig/timelock recommended)
         require(beneficiary != address(0), "ZERO_BENEF");
         require(amount > 0, "ZERO_AMOUNT");
-        
+
         // Gas optimization: Cache storage read
         uint256 currentBalance = totalBalances[token];
         require(currentBalance >= amount, "INSUFFICIENT_TRACKED");
@@ -465,7 +465,7 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
         } else {
             IERC20(token).safeTransfer(beneficiary, amount);
         }
-        
+
         emit DirectWithdraw(msg.sender, beneficiary, token, amount);
     }
 
