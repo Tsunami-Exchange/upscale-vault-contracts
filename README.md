@@ -1,3 +1,3 @@
 # Upscale payment contracts
 
-Currently deployed on: BSC mainnet
+Currently deployed on: ARC mainnet
