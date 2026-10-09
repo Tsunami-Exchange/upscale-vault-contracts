@@ -13,6 +13,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {OptimizedHashing} from "./OptimizedHashing.sol";
 import {TransientStorage} from "./TransientStorage.sol";
 import {IDeterministicVault} from "./interfaces/IDeterministicVault.sol";
+import {IERC20TransferWithAuthorization} from "./interfaces/IERC20TransferWithAuthorization.sol";
 import {PaymentWallet} from "./PaymentWallet.sol";
 
 /**
@@ -29,10 +30,13 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
 
     mapping(address => bool) public tokenWhitelist;                     // ERC20 whitelist
     mapping(address => uint256) public totalBalances;                   // token => total tracked
-    mapping(bytes32 => mapping(address => uint256)) public byPayment;   // paymentId => token => amount
 
     address public intentSigner;                                        // signer for off-chain intents
-    mapping(address => uint256) public nonces;                           // per-beneficiary nonces
+    mapping(address => uint256) public nonces;                          // per-beneficiary nonces
+
+    mapping(address => uint256) public dailyLimits;                     // token => daily withdrawal limit (0 = disabled, MAX_VALUE = no limit)
+    mapping(address => bool) public dailyLimitSet;                      // token => whether daily limit was explicitly set
+    mapping(address => mapping(uint256 => uint256)) public dailyWithdrawals; // token => day => amount withdrawn
 
     // EIP-712 domain
     bytes32 private _DOMAIN_SEPARATOR;
@@ -175,9 +179,37 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
     }
 
     /**
+     * @dev Batch sweep multiple payments in a single transaction
+     * @param paymentIds Array of payment IDs to sweep
+     * @param tokens Array of tokens to sweep (corresponding to each paymentId)
+     * @param payers Array of payer addresses (corresponding to each paymentId)
+     * @return wallets Array of wallet addresses (corresponding to each paymentId)
+     */
+    function sweepBatch(
+        bytes32[] calldata paymentIds,
+        address[] calldata tokens,
+        address[] calldata payers
+    ) external returns (address[] memory wallets) {
+        uint256 length = paymentIds.length;
+        require(length > 0, "EMPTY_ARRAY");
+        require(length == tokens.length, "ARRAY_LENGTH_MISMATCH");
+        require(length == payers.length, "ARRAY_LENGTH_MISMATCH");
+
+        wallets = new address[](length);
+
+        // Deploy all wallets first
+        for (uint256 i = 0; i < length; i++) {
+            wallets[i] = _deploy(paymentIds[i]);
+        }
+
+        // Then initiate sweeps (this will trigger callbacks)
+        for (uint256 i = 0; i < length; i++) {
+            _initiateLazySweep(paymentIds[i], payers[i], tokens[i]);
+        }
+    }
+
+    /**
      * @dev Direct payment to the vault (push payment)
-     * @notice For ERC20 tokens, requires exact-amount approval. Do not approve MAX_UINT256.
-     * @notice The approved amount must exactly match the `amount` parameter (respecting token decimals).
      * @param paymentId The payment ID to credit
      * @param token The token address (address(0) for ETH)
      * @param amount The token amount (for ETH, must match msg.value)
@@ -192,7 +224,6 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             require(amount == ethValue, "ETH_AMOUNT_MISMATCH");
 
             totalBalances[address(0)] += ethValue;
-            byPayment[paymentId][address(0)] += ethValue;
 
             emit DirectPayment(paymentId, msg.sender, address(0), ethValue);
             emit Deposited(paymentId, msg.sender, address(0), ethValue);
@@ -202,17 +233,14 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             require(amount > 0, "ZERO_AMOUNT");
             require(tokenWhitelist[token], "TOKEN_NOT_WHITELISTED");
 
-            // Enforce exact-amount approval to prevent MAX_UINT256 approvals
-            // This reduces Blockaid warnings by ensuring users only approve what they intend to pay
+            // Check allowance
             uint256 allowance = IERC20(token).allowance(msg.sender, address(this));
             require(allowance >= amount, "INSUFFICIENT_ALLOWANCE");
-            require(allowance <= amount, "EXCESSIVE_ALLOWANCE"); // Reject MAX_UINT256-style approvals
 
             // Transfer tokens from sender to vault
             IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
 
             totalBalances[token] += amount;
-            byPayment[paymentId][token] += amount;
 
             emit DirectPayment(paymentId, msg.sender, token, amount);
             emit Deposited(paymentId, msg.sender, token, amount);
@@ -259,7 +287,62 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
 
         totalBalances[token] += amount;
-        byPayment[paymentId][token] += amount;
+
+        emit DirectPayment(paymentId, msg.sender, token, amount);
+        emit Deposited(paymentId, msg.sender, token, amount);
+    }
+
+    /**
+     * @dev Direct payment to the vault using EIP-3009 transferWithAuthorization (gasless transfer)
+     * @notice This function allows payment without a separate approval transaction.
+     * @notice The transferWithAuthorization signature must be signed by the owner of the tokens.
+     * @notice Token must support EIP-3009 transferWithAuthorization functionality.
+     * @param paymentId The payment ID to credit
+     * @param token The token address (must support transferWithAuthorization, cannot be address(0))
+     * @param amount The token amount to transfer
+     * @param validAfter The timestamp after which the authorization is valid
+     * @param validBefore The timestamp before which the authorization is valid
+     * @param nonce A unique nonce to prevent replay attacks
+     * @param v The recovery byte of the signature
+     * @param r The r component of the signature
+     * @param s The s component of the signature
+     */
+    function payDirectWithTransferAuthorization(
+        bytes32 paymentId,
+        address token,
+        uint256 amount,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external nonReentrant {
+        require(paymentId != bytes32(0), "ZERO_PAYMENT_ID");
+        require(token != address(0), "TOKEN_0_FORBIDDEN");
+        require(amount > 0, "ZERO_AMOUNT");
+        require(tokenWhitelist[token], "TOKEN_NOT_WHITELISTED");
+        require(block.timestamp >= validAfter, "AUTHORIZATION_NOT_YET_VALID");
+        require(block.timestamp < validBefore, "AUTHORIZATION_EXPIRED");
+
+        // Use try-catch for transferWithAuthorization to handle tokens that don't support it gracefully
+        try IERC20TransferWithAuthorization(token).transferWithAuthorization(
+            msg.sender,
+            address(this),
+            amount,
+            validAfter,
+            validBefore,
+            nonce,
+            v,
+            r,
+            s
+        ) {
+            // Transfer succeeded, update balances
+        } catch {
+            revert("TRANSFER_WITH_AUTHORIZATION_FAILED");
+        }
+
+        totalBalances[token] += amount;
 
         emit DirectPayment(paymentId, msg.sender, token, amount);
         emit Deposited(paymentId, msg.sender, token, amount);
@@ -286,6 +369,53 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
         require(signer != address(0), "ZERO_SIGNER");
         intentSigner = signer;
         emit IntentSignerSet(signer);
+    }
+
+    /**
+     * @dev Sets the daily withdrawal limit for a token
+     * @param token The token address (address(0) for ETH)
+     * @param limit The daily limit (0 = withdraw disabled, MAX_VALUE = no limit)
+     * @notice Only works for whitelisted tokens (ETH is always allowed)
+     */
+    function setDailyLimit(address token, uint256 limit) external onlyOwner {
+        if (token != address(0)) {
+            require(tokenWhitelist[token], "TOKEN_NOT_WHITELISTED");
+        }
+        dailyLimits[token] = limit;
+        dailyLimitSet[token] = true; // Mark that limit was explicitly set
+        emit DailyLimitSet(token, limit);
+    }
+
+    /**
+     * @dev Internal function to check and update daily withdrawal limits
+     * @param token The token address
+     * @param amount The withdrawal amount
+     */
+    function _checkDailyLimit(address token, uint256 amount) internal {
+        // If limit was never set, allow withdrawals (by default no limit)
+        if (!dailyLimitSet[token]) {
+            return;
+        }
+
+        uint256 limit = dailyLimits[token];
+        
+        // If limit is MAX_VALUE, no limit enforced
+        if (limit == type(uint256).max) {
+            return;
+        }
+
+        // Calculate current day (timestamp / 1 day)
+        uint256 currentDay = block.timestamp / 1 days;
+        uint256 dailyWithdrawn = dailyWithdrawals[token][currentDay];
+        
+        // If limit is 0, withdrawals are disabled (explicitly set by admin)
+        require(limit > 0, "DAILY_LIMIT_DISABLED");
+        
+        // Check if withdrawal would exceed daily limit
+        require(dailyWithdrawn + amount <= limit, "DAILY_LIMIT_EXCEEDED");
+        
+        // Update daily withdrawal tracking
+        dailyWithdrawals[token][currentDay] = dailyWithdrawn + amount;
     }
 
     /* --------------------- Lazy sweep (Vault-initiated) --------------------- */
@@ -331,7 +461,6 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             // Gas optimization: Cache zero address
             address zeroAddr = address(0);
             totalBalances[zeroAddr] += nativeAmt;
-            byPayment[paymentId][zeroAddr] += nativeAmt;
             emit Deposited(paymentId, payer, zeroAddr, nativeAmt);
         }
 
@@ -341,7 +470,6 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
         if (token != address(0) && tokenAmount > 0) {
             require(tokenWhitelist[token], "TOKEN_NOT_WHITELISTED_ON_SWEEP");
             totalBalances[token] += tokenAmount;
-            byPayment[paymentId][token] += tokenAmount;
             emit Deposited(paymentId, payer, token, tokenAmount);
         }
 
@@ -425,6 +553,9 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator(), structHash));
         require(ECDSA.recover(digest, signature) == signer, "BAD_INTENT_SIG");
 
+        // Check daily limit before proceeding
+        _checkDailyLimit(token, amount);
+
         // Gas optimization: Cache storage read
         uint256 currentBalance = totalBalances[token];
         require(currentBalance >= amount, "INSUFFICIENT_TRACKED");
@@ -438,35 +569,6 @@ contract DeterministicVault is IDeterministicVault, Initializable, OwnableUpgrad
             IERC20(token).safeTransfer(beneficiary, amount);
         }
         emit Withdrawn(beneficiary, token, amount, nonce);
-    }
-
-    /**
-     * @dev Direct withdrawal by owner (multisig/timelock recommended)
-     * @notice This function allows the owner to withdraw funds directly without signatures.
-     * @notice WARNING: Requires owner (multisig/timelock recommended). Do not grant single EOA direct withdrawal power.
-     * @notice The intentSigner should only sign off-chain intents; actual withdrawals should go through owner/multisig.
-     * @param beneficiary The beneficiary address
-     * @param token The token address (address(0) for ETH)
-     * @param amount The amount to withdraw
-     */
-    function withdrawDirect(address beneficiary, address token, uint256 amount) external onlyOwner nonReentrant {
-        // msg.sender is owner (multisig/timelock recommended)
-        require(beneficiary != address(0), "ZERO_BENEF");
-        require(amount > 0, "ZERO_AMOUNT");
-
-        // Gas optimization: Cache storage read
-        uint256 currentBalance = totalBalances[token];
-        require(currentBalance >= amount, "INSUFFICIENT_TRACKED");
-        totalBalances[token] = currentBalance - amount;
-
-        if (token == address(0)) {
-            (bool ok, ) = beneficiary.call{value: amount}("");
-            require(ok, "NATIVE_SEND_FAIL");
-        } else {
-            IERC20(token).safeTransfer(beneficiary, amount);
-        }
-
-        emit DirectWithdraw(msg.sender, beneficiary, token, amount);
     }
 
     /* --------------------- Receive (discouraged) --------------------- */

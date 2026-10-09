@@ -54,6 +54,7 @@ contract UpgradeableVaultTest is Test {
 
     function test_InitialState() public {
         assertEq(vaultProxy.intentSigner(), intentSigner);
+        assertEq(vaultProxy.owner(), owner);
         assertTrue(vaultProxy.tokenWhitelist(address(token)));
     }
 
@@ -67,7 +68,6 @@ contract UpgradeableVaultTest is Test {
         vm.stopPrank();
 
         assertEq(vaultProxy.totalBalances(address(token)), amount);
-        assertEq(vaultProxy.byPayment(paymentId, address(token)), amount);
     }
 
     function test_Sweep() public {
@@ -84,7 +84,6 @@ contract UpgradeableVaultTest is Test {
         vaultProxy.sweep(paymentId, address(token), user);
 
         assertEq(vaultProxy.totalBalances(address(token)), amount);
-        assertEq(vaultProxy.byPayment(paymentId, address(token)), amount);
     }
 
     function test_WithdrawWithIntent() public {
@@ -117,23 +116,6 @@ contract UpgradeableVaultTest is Test {
         assertEq(token.balanceOf(user), 1000 ether);
     }
 
-    function test_DirectWithdraw() public {
-        bytes32 paymentId = keccak256("test");
-        uint256 amount = 100 ether;
-
-        // First make a payment
-        vm.startPrank(user);
-        token.approve(address(vaultProxy), amount);
-        vaultProxy.payDirect(paymentId, address(token), amount);
-        vm.stopPrank();
-
-        // Direct withdraw by owner (intentSigner no longer has permission)
-        vm.prank(owner);
-        vaultProxy.withdrawDirect(user, address(token), amount);
-
-        assertEq(vaultProxy.totalBalances(address(token)), 0);
-        assertEq(token.balanceOf(user), 1000 ether);
-    }
 
     function test_AdminTransfer() public {
         bytes32 paymentId = keccak256("test");

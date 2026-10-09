@@ -11,8 +11,10 @@ import {IPaymentWallet} from "../contracts/interfaces/IPaymentWallet.sol";
 
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockERC20Permit} from "./mocks/MockERC20Permit.sol";
+import {MockERC20TransferWithAuthorization} from "./mocks/MockERC20TransferWithAuthorization.sol";
 import {Receiver, RevertingReceiver} from "./mocks/TestReceivers.sol";
 import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
+import {IERC20TransferWithAuthorization} from "../contracts/interfaces/IERC20TransferWithAuthorization.sol";
 
 /**
  * @title DeterministicVaultTest
@@ -23,6 +25,7 @@ contract DeterministicVaultTest is Test {
     MockERC20 tokenA;
     MockERC20 tokenB;
     MockERC20Permit tokenPermit;
+    MockERC20TransferWithAuthorization tokenTransferAuth;
     Receiver recv;
     RevertingReceiver badRecv;
 
@@ -35,8 +38,9 @@ contract DeterministicVaultTest is Test {
     uint256 signerPk;
     address signerAddr;
     
-    // permit signer keypair
+    // permit signer keypair (alice's actual address will be derived from this)
     uint256 alicePk;
+    address aliceAddr;
 
     function setUp() public {
         // Deploy implementation (has _disableInitializers() for security)
@@ -57,6 +61,7 @@ contract DeterministicVaultTest is Test {
         tokenA = new MockERC20("TokenA","TKA");
         tokenB = new MockERC20("TokenB","TKB");
         tokenPermit = new MockERC20Permit("TokenPermit", "TP");
+        tokenTransferAuth = new MockERC20TransferWithAuthorization("TokenTransferAuth", "TTA");
         recv = new Receiver();
         badRecv = new RevertingReceiver();
 
@@ -66,15 +71,18 @@ contract DeterministicVaultTest is Test {
         
         // configure permit signer (alice)
         alicePk = 0x1A11CE; // arbitrary, different from signerPk
+        aliceAddr = vm.addr(alicePk); // Get the address that corresponds to alicePk
 
         vm.prank(admin);
         vault.setIntentSigner(signerAddr);
 
-        // whitelist TokenA and TokenPermit
+        // whitelist TokenA, TokenPermit, and TokenTransferAuth
         vm.prank(admin);
         vault.setWhitelist(address(tokenA), true);
         vm.prank(admin);
         vault.setWhitelist(address(tokenPermit), true);
+        vm.prank(admin);
+        vault.setWhitelist(address(tokenTransferAuth), true);
     }
 
     /* ───────────────────── Helpers ───────────────────── */
@@ -136,6 +144,49 @@ contract DeterministicVaultTest is Test {
         return vm.sign(ownerPk, digest);
     }
 
+    /**
+     * @dev Helper to sign EIP-3009 transferWithAuthorization signature
+     * @param from The token owner
+     * @param to The recipient (vault)
+     * @param value The amount to transfer
+     * @param validAfter The timestamp after which the authorization is valid
+     * @param validBefore The timestamp before which the authorization is valid
+     * @param nonce A unique nonce
+     * @param token The token contract
+     * @param ownerPk The private key of the owner
+     * @return v The recovery byte of the signature
+     * @return r The r component of the signature
+     * @return s The s component of the signature
+     */
+    function _signTransferWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        IERC20TransferWithAuthorization token,
+        uint256 ownerPk
+    ) internal view returns (uint8 v, bytes32 r, bytes32 s) {
+        bytes32 TRANSFER_WITH_AUTHORIZATION_TYPEHASH = keccak256(
+            "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+        );
+        bytes32 structHash = keccak256(
+            abi.encode(
+                TRANSFER_WITH_AUTHORIZATION_TYPEHASH,
+                from,
+                to,
+                value,
+                validAfter,
+                validBefore,
+                nonce
+            )
+        );
+        bytes32 domainSeparator = token.DOMAIN_SEPARATOR();
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        return vm.sign(ownerPk, digest);
+    }
+
     /* ───────────────────── Core: deterministic address + lazy deploy + sweep (ETH only) ───────────────────── */
 
     function test_LazyDeployAndSweep_ETHOnly() public {
@@ -160,7 +211,6 @@ contract DeterministicVaultTest is Test {
         // accounted in vault
         uint256 tEth = vault.totalBalances(address(0));
         assertEq(tEth, ethAmt, "vault total ETH mismatch");
-        assertEq(vault.byPayment(pid, address(0)), ethAmt, "per-payment ETH mismatch");
 
         // wallet should be marked swept
         assertTrue(PaymentWallet(payable(wallet)).swept(), "swept flag not set");
@@ -186,9 +236,7 @@ contract DeterministicVaultTest is Test {
         vault.sweep(pid, address(tokenA), bob);
         vm.stopPrank();
 
-        // Accounting: ETH + TokenA booked for pid
-        assertEq(vault.byPayment(pid, address(0)), 1 ether);
-        assertEq(vault.byPayment(pid, address(tokenA)), 1_000e18);
+        // Accounting: ETH + TokenA booked
 
         // Totals reflect both
         assertEq(vault.totalBalances(address(0)), 1 ether);
@@ -215,8 +263,230 @@ contract DeterministicVaultTest is Test {
         // Token should remain in wallet (not transferred)
         assertEq(tokenB.balanceOf(predicted), 777e18);
         assertEq(tokenB.balanceOf(payable(address(vault))), 0);
-        assertEq(vault.byPayment(pid, address(tokenB)), 0);
         assertEq(vault.totalBalances(address(tokenB)), 0);
+    }
+
+    /* ───────────────────── Batch Sweep Tests ───────────────────── */
+
+    function test_SweepBatch_ETHOnly_MultiplePayments() public {
+        bytes32 pid1 = _uuid("batch-eth-1");
+        bytes32 pid2 = _uuid("batch-eth-2");
+        bytes32 pid3 = _uuid("batch-eth-3");
+        
+        address predicted1 = vault.walletAddress(pid1);
+        address predicted2 = vault.walletAddress(pid2);
+        address predicted3 = vault.walletAddress(pid3);
+        
+        // Fund all wallets
+        _fundEth(alice, 5 ether);
+        vm.prank(alice);
+        (bool ok1,) = predicted1.call{value: 1 ether}("");
+        assertTrue(ok1);
+        vm.prank(alice);
+        (bool ok2,) = predicted2.call{value: 2 ether}("");
+        assertTrue(ok2);
+        vm.prank(alice);
+        (bool ok3,) = predicted3.call{value: 1.5 ether}("");
+        assertTrue(ok3);
+        
+        // Batch sweep
+        bytes32[] memory paymentIds = new bytes32[](3);
+        address[] memory tokens = new address[](3);
+        address[] memory payers = new address[](3);
+        
+        paymentIds[0] = pid1;
+        paymentIds[1] = pid2;
+        paymentIds[2] = pid3;
+        tokens[0] = address(0);
+        tokens[1] = address(0);
+        tokens[2] = address(0);
+        payers[0] = alice;
+        payers[1] = bob;
+        payers[2] = alice;
+        
+        address[] memory wallets = vault.sweepBatch(paymentIds, tokens, payers);
+        
+        // Verify wallets
+        assertEq(wallets[0], predicted1);
+        assertEq(wallets[1], predicted2);
+        assertEq(wallets[2], predicted3);
+        assertEq(wallets.length, 3);
+        
+        // Verify all wallets are deployed
+        assertGt(wallets[0].code.length, 0);
+        assertGt(wallets[1].code.length, 0);
+        assertGt(wallets[2].code.length, 0);
+        
+        // Verify balances
+        assertEq(vault.totalBalances(address(0)), 4.5 ether);
+        assertEq(payable(address(vault)).balance, 4.5 ether);
+        
+        // Verify wallets are swept
+        assertTrue(PaymentWallet(payable(wallets[0])).swept());
+        assertTrue(PaymentWallet(payable(wallets[1])).swept());
+        assertTrue(PaymentWallet(payable(wallets[2])).swept());
+    }
+
+    function test_SweepBatch_MixedTokens() public {
+        bytes32 pid1 = _uuid("batch-mixed-1");
+        bytes32 pid2 = _uuid("batch-mixed-2");
+        
+        address predicted1 = vault.walletAddress(pid1);
+        address predicted2 = vault.walletAddress(pid2);
+        
+        // Fund wallet 1 with ETH
+        _fundEth(alice, 1 ether);
+        vm.prank(alice);
+        (bool ok1,) = predicted1.call{value: 1 ether}("");
+        assertTrue(ok1);
+        
+        // Fund wallet 2 with TokenA
+        tokenA.mint(predicted2, 500e18);
+        
+        // Batch sweep
+        bytes32[] memory paymentIds = new bytes32[](2);
+        address[] memory tokens = new address[](2);
+        address[] memory payers = new address[](2);
+        
+        paymentIds[0] = pid1;
+        paymentIds[1] = pid2;
+        tokens[0] = address(0);
+        tokens[1] = address(tokenA);
+        payers[0] = alice;
+        payers[1] = bob;
+        
+        address[] memory wallets = vault.sweepBatch(paymentIds, tokens, payers);
+        
+        // Verify balances
+        assertEq(vault.totalBalances(address(0)), 1 ether);
+        assertEq(vault.totalBalances(address(tokenA)), 500e18);
+        assertEq(payable(address(vault)).balance, 1 ether);
+        assertEq(tokenA.balanceOf(address(vault)), 500e18);
+    }
+
+    function test_SweepBatch_EmptyArray_Reverts() public {
+        bytes32[] memory paymentIds = new bytes32[](0);
+        address[] memory tokens = new address[](0);
+        address[] memory payers = new address[](0);
+        
+        vm.expectRevert(bytes("EMPTY_ARRAY"));
+        vault.sweepBatch(paymentIds, tokens, payers);
+    }
+
+    function test_SweepBatch_ArrayLengthMismatch_Tokens_Reverts() public {
+        bytes32 pid1 = _uuid("batch-mismatch-1");
+        bytes32[] memory paymentIds = new bytes32[](1);
+        address[] memory tokens = new address[](2); // Wrong length
+        address[] memory payers = new address[](1);
+        
+        paymentIds[0] = pid1;
+        payers[0] = alice;
+        
+        vm.expectRevert(bytes("ARRAY_LENGTH_MISMATCH"));
+        vault.sweepBatch(paymentIds, tokens, payers);
+    }
+
+    function test_SweepBatch_ArrayLengthMismatch_Payers_Reverts() public {
+        bytes32 pid1 = _uuid("batch-mismatch-2");
+        bytes32[] memory paymentIds = new bytes32[](1);
+        address[] memory tokens = new address[](1);
+        address[] memory payers = new address[](2); // Wrong length
+        
+        paymentIds[0] = pid1;
+        tokens[0] = address(0);
+        
+        vm.expectRevert(bytes("ARRAY_LENGTH_MISMATCH"));
+        vault.sweepBatch(paymentIds, tokens, payers);
+    }
+
+    function test_SweepBatch_LargeBatch() public {
+        uint256 batchSize = 10;
+        bytes32[] memory paymentIds = new bytes32[](batchSize);
+        address[] memory tokens = new address[](batchSize);
+        address[] memory payers = new address[](batchSize);
+        
+        _fundEth(alice, batchSize * 1 ether);
+        
+        // Prepare all payments
+        for (uint256 i = 0; i < batchSize; i++) {
+            bytes32 pid = _uuid(string(abi.encodePacked("batch-large-", i)));
+            paymentIds[i] = pid;
+            tokens[i] = address(0);
+            payers[i] = alice;
+            
+            address predicted = vault.walletAddress(pid);
+            vm.prank(alice);
+            (bool ok,) = predicted.call{value: 1 ether}("");
+            assertTrue(ok);
+        }
+        
+        // Execute batch sweep
+        address[] memory wallets = vault.sweepBatch(paymentIds, tokens, payers);
+        
+        // Verify all wallets deployed
+        assertEq(wallets.length, batchSize);
+        for (uint256 i = 0; i < batchSize; i++) {
+            assertGt(wallets[i].code.length, 0);
+            assertTrue(PaymentWallet(payable(wallets[i])).swept());
+        }
+        
+        // Verify total balance
+        assertEq(vault.totalBalances(address(0)), batchSize * 1 ether);
+    }
+
+    function test_SweepBatch_SomeAlreadyDeployed() public {
+        bytes32 pid1 = _uuid("batch-deployed-1");
+        bytes32 pid2 = _uuid("batch-deployed-2");
+        
+        address predicted1 = vault.walletAddress(pid1);
+        address predicted2 = vault.walletAddress(pid2);
+        
+        // Deploy first wallet manually
+        _fundEth(alice, 3 ether);
+        vm.prank(alice);
+        (bool ok1,) = predicted1.call{value: 1 ether}("");
+        assertTrue(ok1);
+        address wallet1 = vault.sweep(pid1, address(0), alice);
+        assertEq(wallet1, predicted1);
+        
+        // Fund second wallet
+        vm.prank(alice);
+        (bool ok2,) = predicted2.call{value: 1 ether}("");
+        assertTrue(ok2);
+        
+        // Batch sweep (first already deployed, second not)
+        bytes32[] memory paymentIds = new bytes32[](2);
+        address[] memory tokens = new address[](2);
+        address[] memory payers = new address[](2);
+        
+        paymentIds[0] = pid1;
+        paymentIds[1] = pid2;
+        tokens[0] = address(0);
+        tokens[1] = address(0);
+        payers[0] = alice;
+        payers[1] = bob;
+        
+        // Should revert because first wallet already swept
+        vm.expectRevert(bytes("ALREADY_SWEPT"));
+        vault.sweepBatch(paymentIds, tokens, payers);
+    }
+
+    function test_SweepBatch_NonWhitelistedToken_Reverts() public {
+        bytes32 pid1 = _uuid("batch-nonwl-1");
+        address predicted1 = vault.walletAddress(pid1);
+        
+        tokenB.mint(predicted1, 100e18);
+        
+        bytes32[] memory paymentIds = new bytes32[](1);
+        address[] memory tokens = new address[](1);
+        address[] memory payers = new address[](1);
+        
+        paymentIds[0] = pid1;
+        tokens[0] = address(tokenB); // Not whitelisted
+        payers[0] = alice;
+        
+        vm.expectRevert(bytes("CALLBACK_FAILED"));
+        vault.sweepBatch(paymentIds, tokens, payers);
     }
 
     /* ───────────────────── Only-one-time sweep enforced ───────────────────── */
@@ -452,7 +722,6 @@ contract DeterministicVaultTest is Test {
 
         // Check balances
         assertEq(vault.totalBalances(address(0)), ethAmount);
-        assertEq(vault.byPayment(pid, address(0)), ethAmount);
         assertEq(payable(address(vault)).balance, ethAmount);
     }
 
@@ -470,7 +739,6 @@ contract DeterministicVaultTest is Test {
 
         // Check balances
         assertEq(vault.totalBalances(address(tokenA)), tokenAmount);
-        assertEq(vault.byPayment(pid, address(tokenA)), tokenAmount);
         assertEq(tokenA.balanceOf(address(vault)), tokenAmount);
         assertEq(tokenA.balanceOf(alice), 0);
     }
@@ -535,29 +803,6 @@ contract DeterministicVaultTest is Test {
         vault.payDirect(pid, address(tokenA), 100e18);
     }
 
-    function test_PayDirect_ERC20_ExcessiveAllowance_Reverts() public {
-        bytes32 pid = _uuid("direct-payment-excessive-approval");
-        uint256 tokenAmount = 100e18;
-        tokenA.mint(alice, tokenAmount);
-        
-        // Approve more than the payment amount (simulating MAX_UINT256 or excessive approval)
-        vm.prank(alice);
-        tokenA.approve(address(vault), 200e18); // Approve more than amount
-        
-        vm.prank(alice);
-        vm.expectRevert(bytes("EXCESSIVE_ALLOWANCE"));
-        vault.payDirect(pid, address(tokenA), tokenAmount);
-        
-        // Verify exact-amount approval works
-        vm.prank(alice);
-        tokenA.approve(address(vault), 0); // Reset
-        vm.prank(alice);
-        tokenA.approve(address(vault), tokenAmount); // Exact amount
-        
-        vm.prank(alice);
-        vault.payDirect(pid, address(tokenA), tokenAmount);
-        assertEq(vault.totalBalances(address(tokenA)), tokenAmount);
-    }
 
     function test_PayDirect_Multiple_SamePaymentId() public {
         bytes32 pid = _uuid("direct-payment-multiple");
@@ -579,9 +824,7 @@ contract DeterministicVaultTest is Test {
         vm.prank(alice);
         vault.payDirect(pid, address(tokenA), 200e18);
 
-        // Check cumulative balances for same payment ID
-        assertEq(vault.byPayment(pid, address(0)), 1.5 ether);
-        assertEq(vault.byPayment(pid, address(tokenA)), 200e18);
+        // Check cumulative balances
         assertEq(vault.totalBalances(address(0)), 1.5 ether);
         assertEq(vault.totalBalances(address(tokenA)), 200e18);
     }
@@ -609,7 +852,321 @@ contract DeterministicVaultTest is Test {
         // Check balances after withdrawal
         assertEq(beneficiary.balance, bobBalanceBefore + withdrawAmount);
         assertEq(vault.totalBalances(address(0)), ethAmount - withdrawAmount);
-        assertEq(vault.byPayment(pid, address(0)), ethAmount); // Per-payment tracking unchanged
+    }
+
+    /* ───────────────────── Direct Payment with Transfer Authorization Tests (EIP-3009) ───────────────────── */
+
+    function test_PayDirectWithTransferAuthorization_Success() public {
+        bytes32 pid = _uuid("direct-payment-transfer-auth");
+        uint256 tokenAmount = 500e18;
+
+        // Mint tokens to aliceAddr (the address that corresponds to alicePk)
+        tokenTransferAuth.mint(aliceAddr, tokenAmount);
+        assertEq(tokenTransferAuth.balanceOf(aliceAddr), tokenAmount);
+
+        // Prepare authorization parameters
+        uint256 validAfter = block.timestamp;
+        uint256 validBefore = block.timestamp + 1 days;
+        bytes32 nonce = keccak256("unique-nonce-1");
+
+        // Sign the transferWithAuthorization
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferWithAuthorization(
+            aliceAddr,
+            address(vault),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            IERC20TransferWithAuthorization(address(tokenTransferAuth)),
+            alicePk
+        );
+
+        // Execute payment with transfer authorization
+        vm.prank(aliceAddr);
+        vault.payDirectWithTransferAuthorization(
+            pid,
+            address(tokenTransferAuth),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            v,
+            r,
+            s
+        );
+
+        // Check balances
+        assertEq(vault.totalBalances(address(tokenTransferAuth)), tokenAmount);
+        assertEq(tokenTransferAuth.balanceOf(address(vault)), tokenAmount);
+        assertEq(tokenTransferAuth.balanceOf(aliceAddr), 0);
+    }
+
+    function test_PayDirectWithTransferAuthorization_ZeroPaymentId_Reverts() public {
+        uint256 tokenAmount = 100e18;
+        tokenTransferAuth.mint(aliceAddr, tokenAmount);
+        uint256 validAfter = block.timestamp;
+        uint256 validBefore = block.timestamp + 1 days;
+        bytes32 nonce = keccak256("nonce-1");
+
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferWithAuthorization(
+            aliceAddr,
+            address(vault),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            IERC20TransferWithAuthorization(address(tokenTransferAuth)),
+            alicePk
+        );
+
+        vm.prank(aliceAddr);
+        vm.expectRevert(bytes("ZERO_PAYMENT_ID"));
+        vault.payDirectWithTransferAuthorization(
+            bytes32(0),
+            address(tokenTransferAuth),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            v,
+            r,
+            s
+        );
+    }
+
+    function test_PayDirectWithTransferAuthorization_Token0Forbidden_Reverts() public {
+        bytes32 pid = _uuid("direct-payment-transfer-auth-token0");
+        uint256 validAfter = block.timestamp;
+        uint256 validBefore = block.timestamp + 1 days;
+        bytes32 nonce = keccak256("nonce-2");
+
+        vm.prank(aliceAddr);
+        vm.expectRevert(bytes("TOKEN_0_FORBIDDEN"));
+        vault.payDirectWithTransferAuthorization(
+            pid,
+            address(0),
+            1 ether,
+            validAfter,
+            validBefore,
+            nonce,
+            0,
+            bytes32(0),
+            bytes32(0)
+        );
+    }
+
+    function test_PayDirectWithTransferAuthorization_ZeroAmount_Reverts() public {
+        bytes32 pid = _uuid("direct-payment-transfer-auth-zero");
+        uint256 validAfter = block.timestamp;
+        uint256 validBefore = block.timestamp + 1 days;
+        bytes32 nonce = keccak256("nonce-3");
+
+        vm.prank(aliceAddr);
+        vm.expectRevert(bytes("ZERO_AMOUNT"));
+        vault.payDirectWithTransferAuthorization(
+            pid,
+            address(tokenTransferAuth),
+            0,
+            validAfter,
+            validBefore,
+            nonce,
+            0,
+            bytes32(0),
+            bytes32(0)
+        );
+    }
+
+    function test_PayDirectWithTransferAuthorization_NotWhitelisted_Reverts() public {
+        bytes32 pid = _uuid("direct-payment-transfer-auth-not-whitelisted");
+        uint256 tokenAmount = 100e18;
+        tokenTransferAuth.mint(aliceAddr, tokenAmount);
+        uint256 validAfter = block.timestamp;
+        uint256 validBefore = block.timestamp + 1 days;
+        bytes32 nonce = keccak256("nonce-4");
+
+        // Remove token from whitelist
+        vm.prank(admin);
+        vault.setWhitelist(address(tokenTransferAuth), false);
+
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferWithAuthorization(
+            aliceAddr,
+            address(vault),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            IERC20TransferWithAuthorization(address(tokenTransferAuth)),
+            alicePk
+        );
+
+        vm.prank(aliceAddr);
+        vm.expectRevert(bytes("TOKEN_NOT_WHITELISTED"));
+        vault.payDirectWithTransferAuthorization(
+            pid,
+            address(tokenTransferAuth),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            v,
+            r,
+            s
+        );
+    }
+
+    function test_PayDirectWithTransferAuthorization_NotYetValid_Reverts() public {
+        bytes32 pid = _uuid("direct-payment-transfer-auth-not-yet-valid");
+        uint256 tokenAmount = 100e18;
+        tokenTransferAuth.mint(aliceAddr, tokenAmount);
+        uint256 validAfter = block.timestamp + 1 days; // Future timestamp
+        uint256 validBefore = block.timestamp + 2 days;
+        bytes32 nonce = keccak256("nonce-5");
+
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferWithAuthorization(
+            aliceAddr,
+            address(vault),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            IERC20TransferWithAuthorization(address(tokenTransferAuth)),
+            alicePk
+        );
+
+        vm.prank(aliceAddr);
+        vm.expectRevert(bytes("AUTHORIZATION_NOT_YET_VALID"));
+        vault.payDirectWithTransferAuthorization(
+            pid,
+            address(tokenTransferAuth),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            v,
+            r,
+            s
+        );
+    }
+
+    function test_PayDirectWithTransferAuthorization_Expired_Reverts() public {
+        bytes32 pid = _uuid("direct-payment-transfer-auth-expired");
+        uint256 tokenAmount = 100e18;
+        tokenTransferAuth.mint(aliceAddr, tokenAmount);
+        uint256 validAfter = 0; // Start from epoch
+        uint256 validBefore = block.timestamp - 1; // Already expired
+        bytes32 nonce = keccak256("nonce-6");
+
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferWithAuthorization(
+            aliceAddr,
+            address(vault),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            IERC20TransferWithAuthorization(address(tokenTransferAuth)),
+            alicePk
+        );
+
+        vm.prank(aliceAddr);
+        vm.expectRevert(bytes("AUTHORIZATION_EXPIRED"));
+        vault.payDirectWithTransferAuthorization(
+            pid,
+            address(tokenTransferAuth),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            v,
+            r,
+            s
+        );
+    }
+
+    function test_PayDirectWithTransferAuthorization_InvalidSignature_Reverts() public {
+        bytes32 pid = _uuid("direct-payment-transfer-auth-invalid-sig");
+        uint256 tokenAmount = 100e18;
+        tokenTransferAuth.mint(aliceAddr, tokenAmount);
+        uint256 validAfter = block.timestamp;
+        uint256 validBefore = block.timestamp + 1 days;
+        bytes32 nonce = keccak256("nonce-7");
+
+        // Use wrong signature (from bob instead of aliceAddr)
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferWithAuthorization(
+            bob, // Wrong signer
+            address(vault),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            IERC20TransferWithAuthorization(address(tokenTransferAuth)),
+            alicePk
+        );
+
+        vm.prank(aliceAddr);
+        vm.expectRevert(bytes("TRANSFER_WITH_AUTHORIZATION_FAILED"));
+        vault.payDirectWithTransferAuthorization(
+            pid,
+            address(tokenTransferAuth),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            v,
+            r,
+            s
+        );
+    }
+
+    function test_PayDirectWithTransferAuthorization_ReplayAttack_Reverts() public {
+        bytes32 pid = _uuid("direct-payment-transfer-auth-replay");
+        uint256 tokenAmount = 100e18;
+        tokenTransferAuth.mint(aliceAddr, tokenAmount);
+        uint256 validAfter = block.timestamp;
+        uint256 validBefore = block.timestamp + 1 days;
+        bytes32 nonce = keccak256("nonce-8");
+
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferWithAuthorization(
+            aliceAddr,
+            address(vault),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            IERC20TransferWithAuthorization(address(tokenTransferAuth)),
+            alicePk
+        );
+
+        // First use - should succeed
+        vm.prank(aliceAddr);
+        vault.payDirectWithTransferAuthorization(
+            pid,
+            address(tokenTransferAuth),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce,
+            v,
+            r,
+            s
+        );
+
+        // Mint more tokens for second attempt
+        tokenTransferAuth.mint(aliceAddr, tokenAmount);
+
+        // Replay attack - should fail
+        vm.prank(aliceAddr);
+        vm.expectRevert(bytes("TRANSFER_WITH_AUTHORIZATION_FAILED"));
+        vault.payDirectWithTransferAuthorization(
+            pid,
+            address(tokenTransferAuth),
+            tokenAmount,
+            validAfter,
+            validBefore,
+            nonce, // Same nonce
+            v,
+            r,
+            s
+        );
     }
 
     /* ───────────────────── Direct receives and events sanity ───────────────────── */
@@ -623,201 +1180,7 @@ contract DeterministicVaultTest is Test {
         // per-payment for pid=0x0 is not asserted beyond Deposited event; we at least know totals grow
     }
 
-    /* ───────────────────── Direct Withdrawal Tests (Owner Only) ───────────────────── */
-
-    function test_WithdrawDirect_ETH_Success() public {
-        // Seed ETH via direct payment
-        bytes32 pid = _uuid("direct-withdraw-eth");
-        uint256 ethAmount = 2 ether;
-
-        _fundEth(alice, ethAmount);
-        vm.prank(alice);
-        vault.payDirect{value: ethAmount}(pid, address(0), ethAmount);
-
-        // Owner withdraws directly to beneficiary
-        address beneficiary = bob;
-        uint256 withdrawAmount = 0.8 ether;
-        uint256 bobBalanceBefore = beneficiary.balance;
-
-        vm.prank(admin);
-        vault.withdrawDirect(beneficiary, address(0), withdrawAmount);
-
-        // Check balances
-        assertEq(beneficiary.balance, bobBalanceBefore + withdrawAmount);
-        assertEq(vault.totalBalances(address(0)), ethAmount - withdrawAmount);
-        assertEq(payable(address(vault)).balance, ethAmount - withdrawAmount);
-    }
-
-    function test_WithdrawDirect_ERC20_Success() public {
-        // Seed ERC20 via direct payment
-        bytes32 pid = _uuid("direct-withdraw-erc20");
-        uint256 tokenAmount = 1000e18;
-
-        tokenA.mint(alice, tokenAmount);
-        vm.prank(alice);
-        tokenA.approve(address(vault), tokenAmount);
-        vm.prank(alice);
-        vault.payDirect(pid, address(tokenA), tokenAmount);
-
-        // Owner withdraws directly to beneficiary
-        address beneficiary = bob;
-        uint256 withdrawAmount = 300e18;
-
-        vm.prank(admin);
-        vault.withdrawDirect(beneficiary, address(tokenA), withdrawAmount);
-
-        // Check balances
-        assertEq(tokenA.balanceOf(beneficiary), withdrawAmount);
-        assertEq(vault.totalBalances(address(tokenA)), tokenAmount - withdrawAmount);
-        assertEq(tokenA.balanceOf(address(vault)), tokenAmount - withdrawAmount);
-    }
-
-    function test_WithdrawDirect_OnlyIntentSigner() public {
-        // Seed some ETH
-        bytes32 pid = _uuid("direct-withdraw-only-signer");
-        _fundEth(alice, 1 ether);
-        vm.prank(alice);
-        vault.payDirect{value: 1 ether}(pid, address(0), 1 ether);
-
-        // Try to withdraw as non-signer (should fail)
-        vm.prank(alice);
-        vm.expectRevert();  // Now requires owner, not intentSigner
-        vault.withdrawDirect(bob, address(0), 0.5 ether);
-
-        // Withdraw as owner (should succeed)
-        vm.prank(admin);
-        vault.withdrawDirect(bob, address(0), 0.5 ether);
-        assertEq(vault.totalBalances(address(0)), 0.5 ether);
-    }
-
-    function test_WithdrawDirect_ZeroBeneficiary_Reverts() public {
-        // Seed some ETH
-        bytes32 pid = _uuid("direct-withdraw-zero-benef");
-        _fundEth(alice, 1 ether);
-        vm.prank(alice);
-        vault.payDirect{value: 1 ether}(pid, address(0), 1 ether);
-
-        vm.prank(admin);
-        vm.expectRevert(bytes("ZERO_BENEF"));
-        vault.withdrawDirect(address(0), address(0), 0.5 ether);
-    }
-
-    function test_WithdrawDirect_ZeroAmount_Reverts() public {
-        // Seed some ETH
-        bytes32 pid = _uuid("direct-withdraw-zero-amount");
-        _fundEth(alice, 1 ether);
-        vm.prank(alice);
-        vault.payDirect{value: 1 ether}(pid, address(0), 1 ether);
-
-        vm.prank(admin);
-        vm.expectRevert(bytes("ZERO_AMOUNT"));
-        vault.withdrawDirect(bob, address(0), 0);
-    }
-
-    function test_WithdrawDirect_InsufficientTracked_Reverts() public {
-        // No funds in vault
-        vm.prank(admin);
-        vm.expectRevert(bytes("INSUFFICIENT_TRACKED"));
-        vault.withdrawDirect(bob, address(0), 1 ether);
-    }
-
-    function test_WithdrawDirect_NativeSendFail_Reverts() public {
-        // Seed some ETH
-        bytes32 pid = _uuid("direct-withdraw-send-fail");
-        _fundEth(alice, 1 ether);
-        vm.prank(alice);
-        vault.payDirect{value: 1 ether}(pid, address(0), 1 ether);
-
-        // Try to withdraw to reverting receiver
-        vm.prank(admin);
-        vm.expectRevert(bytes("NATIVE_SEND_FAIL"));
-        vault.withdrawDirect(address(badRecv), address(0), 0.5 ether);
-    }
-
-    function test_WithdrawDirect_Multiple_Withdrawals() public {
-        // Seed funds
-        bytes32 pid = _uuid("direct-withdraw-multiple");
-        _fundEth(alice, 3 ether);
-        vm.prank(alice);
-        vault.payDirect{value: 3 ether}(pid, address(0), 3 ether);
-
-        tokenA.mint(alice, 1500e18);
-        vm.prank(alice);
-        tokenA.approve(address(vault), 1500e18);
-        vm.prank(alice);
-        vault.payDirect(pid, address(tokenA), 1500e18);
-
-        // Multiple withdrawals
-        vm.startPrank(admin);
-
-        // First withdrawal - ETH to Alice
-        vault.withdrawDirect(alice, address(0), 1 ether);
-        assertEq(alice.balance, 1 ether);
-        assertEq(vault.totalBalances(address(0)), 2 ether);
-
-        // Second withdrawal - Tokens to Bob
-        vault.withdrawDirect(bob, address(tokenA), 500e18);
-        assertEq(tokenA.balanceOf(bob), 500e18);
-        assertEq(vault.totalBalances(address(tokenA)), 1000e18);
-
-        // Third withdrawal - ETH to Bob
-        vault.withdrawDirect(bob, address(0), 0.5 ether);
-        assertEq(bob.balance, 0.5 ether);
-        assertEq(vault.totalBalances(address(0)), 1.5 ether);
-
-        vm.stopPrank();
-    }
-
-    function test_WithdrawDirect_AfterIntentSignerChange() public {
-        // Seed some ETH
-        bytes32 pid = _uuid("direct-withdraw-signer-change");
-        _fundEth(alice, 2 ether);
-        vm.prank(alice);
-        vault.payDirect{value: 2 ether}(pid, address(0), 2 ether);
-
-        // Current signer can withdraw
-        vm.prank(admin);
-        vault.withdrawDirect(bob, address(0), 0.5 ether);
-        assertEq(vault.totalBalances(address(0)), 1.5 ether);
-
-        // Change intent signer
-        address newSigner = makeAddr("newSigner");
-        vm.prank(admin);
-        vault.setIntentSigner(newSigner);
-
-        // Old signer can no longer withdraw
-        vm.prank(signerAddr);
-        vm.expectRevert();  // Now requires owner, not intentSigner
-        vault.withdrawDirect(bob, address(0), 0.5 ether);
-
-        // New signer can withdraw
-        vm.prank(newSigner);
-        vm.expectRevert();
-        vault.withdrawDirect(alice, address(0), 0.8 ether);
-        
-        // Only owner can withdraw
-        vm.prank(admin);
-        vault.withdrawDirect(alice, address(0), 0.8 ether);
-        assertEq(vault.totalBalances(address(0)), 0.7 ether);
-    }
-
-    function test_WithdrawDirect_Events() public {
-        // Seed some funds
-        bytes32 pid = _uuid("direct-withdraw-events");
-        _fundEth(alice, 1 ether);
-        vm.prank(alice);
-        vault.payDirect{value: 1 ether}(pid, address(0), 1 ether);
-
-        // Check DirectWithdraw event is emitted
-        vm.expectEmit(true, true, true, true);
-        emit DirectWithdraw(admin, bob, address(0), 0.6 ether);
-
-        vm.prank(admin);
-        vault.withdrawDirect(bob, address(0), 0.6 ether);
-    }
-
     // Helper to define the event for expectEmit
-    event DirectWithdraw(address indexed signer, address indexed beneficiary, address indexed token, uint256 amount);
     event DirectPayment(bytes32 indexed paymentId, address indexed payer, address indexed token, uint256 amount);
     event Deposited(bytes32 indexed paymentId, address indexed payer, address indexed token, uint256 amount);
 
@@ -878,4 +1241,267 @@ contract DeterministicVaultTest is Test {
         vm.expectRevert();
         vault.withdrawWithIntent(user, address(0), amt, deadline, sig);
     }
+
+    /* ───────────────────── Daily Limit Tests ───────────────────── */
+
+    function test_SetDailyLimit_OnlyOwner() public {
+        vm.prank(admin);
+        vault.setDailyLimit(address(tokenA), 1000e18);
+        assertEq(vault.dailyLimits(address(tokenA)), 1000e18);
+
+        // Non-owner should fail
+        vm.prank(alice);
+        vm.expectRevert();
+        vault.setDailyLimit(address(tokenA), 500e18);
+    }
+
+    function test_SetDailyLimit_OnlyWhitelistedTokens() public {
+        // Set limit for whitelisted token should succeed
+        vm.prank(admin);
+        vault.setDailyLimit(address(tokenA), 1000e18);
+        assertEq(vault.dailyLimits(address(tokenA)), 1000e18);
+
+        // Set limit for non-whitelisted token should fail
+        vm.prank(admin);
+        vm.expectRevert(bytes("TOKEN_NOT_WHITELISTED"));
+        vault.setDailyLimit(address(tokenB), 1000e18);
+    }
+
+    function test_SetDailyLimit_ETH_AlwaysAllowed() public {
+        // ETH (address(0)) should always be allowed even if not whitelisted
+        vm.prank(admin);
+        vault.setDailyLimit(address(0), 10 ether);
+        assertEq(vault.dailyLimits(address(0)), 10 ether);
+    }
+
+    function test_DailyLimit_Default_NoLimit() public {
+        // By default, daily limit should be 0 (which means no limit enforced if MAX_VALUE)
+        // Actually, default is 0, which means disabled. Let's check that withdrawals work without limit set
+        bytes32 pid = _uuid("daily-limit-default");
+        _fundEth(alice, 5 ether);
+        vm.prank(alice);
+        (bool ok,) = vault.walletAddress(pid).call{value: 5 ether}("");
+        assertTrue(ok);
+        vault.sweep(pid, address(0), alice);
+
+        // Withdrawal should work without limit set (default behavior)
+        address beneficiary = bob;
+        uint256 nonce = vault.nonces(beneficiary);
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory sig = _signWithdraw(beneficiary, address(0), 5 ether, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(0), 5 ether, deadline, sig);
+        assertEq(beneficiary.balance, 5 ether);
+    }
+
+    function test_DailyLimit_Zero_DisablesWithdrawals() public {
+        // Set daily limit to 0
+        vm.prank(admin);
+        vault.setDailyLimit(address(0), 0);
+
+        // Seed funds
+        bytes32 pid = _uuid("daily-limit-zero");
+        _fundEth(alice, 2 ether);
+        vm.prank(alice);
+        (bool ok,) = vault.walletAddress(pid).call{value: 2 ether}("");
+        assertTrue(ok);
+        vault.sweep(pid, address(0), alice);
+
+        // Withdrawal should fail
+        address beneficiary = bob;
+        uint256 nonce = vault.nonces(beneficiary);
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory sig = _signWithdraw(beneficiary, address(0), 1 ether, nonce, deadline);
+        
+        vm.expectRevert(bytes("DAILY_LIMIT_DISABLED"));
+        vault.withdrawWithIntent(beneficiary, address(0), 1 ether, deadline, sig);
+    }
+
+    function test_DailyLimit_WithdrawWithIntent_Enforced() public {
+        // Set daily limit to 2 ETH
+        vm.prank(admin);
+        vault.setDailyLimit(address(0), 2 ether);
+
+        // Seed funds
+        bytes32 pid = _uuid("daily-limit-intent");
+        _fundEth(alice, 5 ether);
+        vm.prank(alice);
+        (bool ok,) = vault.walletAddress(pid).call{value: 5 ether}("");
+        assertTrue(ok);
+        vault.sweep(pid, address(0), alice);
+
+        address beneficiary = bob;
+        uint256 nonce = vault.nonces(beneficiary);
+        uint256 deadline = block.timestamp + 1 days;
+
+        // First withdrawal: 1.5 ETH (within limit)
+        bytes memory sig1 = _signWithdraw(beneficiary, address(0), 1.5 ether, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(0), 1.5 ether, deadline, sig1);
+        assertEq(beneficiary.balance, 1.5 ether);
+        assertEq(vault.dailyWithdrawals(address(0), block.timestamp / 1 days), 1.5 ether);
+
+        // Second withdrawal: 0.5 ETH (total 2 ETH, exactly at limit)
+        nonce = vault.nonces(beneficiary);
+        bytes memory sig2 = _signWithdraw(beneficiary, address(0), 0.5 ether, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(0), 0.5 ether, deadline, sig2);
+        assertEq(beneficiary.balance, 2 ether);
+        assertEq(vault.dailyWithdrawals(address(0), block.timestamp / 1 days), 2 ether);
+
+        // Third withdrawal: 0.1 ETH (would exceed limit)
+        nonce = vault.nonces(beneficiary);
+        bytes memory sig3 = _signWithdraw(beneficiary, address(0), 0.1 ether, nonce, deadline);
+        vm.expectRevert(bytes("DAILY_LIMIT_EXCEEDED"));
+        vault.withdrawWithIntent(beneficiary, address(0), 0.1 ether, deadline, sig3);
+    }
+
+
+    function test_DailyLimit_ERC20_Enforced() public {
+        // Set daily limit for tokenA
+        vm.prank(admin);
+        vault.setDailyLimit(address(tokenA), 500e18);
+
+        // Seed funds
+        bytes32 pid = _uuid("daily-limit-erc20");
+        tokenA.mint(vault.walletAddress(pid), 1000e18);
+        vault.sweep(pid, address(tokenA), alice);
+
+        address beneficiary = bob;
+        uint256 nonce = vault.nonces(beneficiary);
+        uint256 deadline = block.timestamp + 1 days;
+
+        // First withdrawal: 300e18 (within limit)
+        bytes memory sig1 = _signWithdraw(beneficiary, address(tokenA), 300e18, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(tokenA), 300e18, deadline, sig1);
+        assertEq(tokenA.balanceOf(beneficiary), 300e18);
+        assertEq(vault.dailyWithdrawals(address(tokenA), block.timestamp / 1 days), 300e18);
+
+        // Second withdrawal: 200e18 (total 500e18, exactly at limit)
+        nonce = vault.nonces(beneficiary);
+        bytes memory sig2 = _signWithdraw(beneficiary, address(tokenA), 200e18, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(tokenA), 200e18, deadline, sig2);
+        assertEq(tokenA.balanceOf(beneficiary), 500e18);
+        assertEq(vault.dailyWithdrawals(address(tokenA), block.timestamp / 1 days), 500e18);
+
+        // Third withdrawal: 1e18 (would exceed limit)
+        nonce = vault.nonces(beneficiary);
+        bytes memory sig3 = _signWithdraw(beneficiary, address(tokenA), 1e18, nonce, deadline);
+        vm.expectRevert(bytes("DAILY_LIMIT_EXCEEDED"));
+        vault.withdrawWithIntent(beneficiary, address(tokenA), 1e18, deadline, sig3);
+    }
+
+    function test_DailyLimit_ResetsOnNewDay() public {
+        // Set daily limit to 1 ETH
+        vm.prank(admin);
+        vault.setDailyLimit(address(0), 1 ether);
+
+        // Seed funds
+        bytes32 pid = _uuid("daily-limit-reset");
+        _fundEth(alice, 3 ether);
+        vm.prank(alice);
+        (bool ok,) = vault.walletAddress(pid).call{value: 3 ether}("");
+        assertTrue(ok);
+        vault.sweep(pid, address(0), alice);
+
+        address beneficiary = bob;
+        uint256 nonce = vault.nonces(beneficiary);
+        uint256 deadline = block.timestamp + 1 days;
+
+        // Withdraw full limit on day 1
+        bytes memory sig1 = _signWithdraw(beneficiary, address(0), 1 ether, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(0), 1 ether, deadline, sig1);
+        assertEq(beneficiary.balance, 1 ether);
+
+        uint256 day1 = block.timestamp / 1 days;
+        assertEq(vault.dailyWithdrawals(address(0), day1), 1 ether);
+
+        // Advance time by 1 day
+        vm.warp(block.timestamp + 1 days);
+
+        // Should be able to withdraw again on new day
+        nonce = vault.nonces(beneficiary);
+        deadline = block.timestamp + 1 days;
+        bytes memory sig2 = _signWithdraw(beneficiary, address(0), 1 ether, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(0), 1 ether, deadline, sig2);
+        assertEq(beneficiary.balance, 2 ether);
+
+        uint256 day2 = block.timestamp / 1 days;
+        assertEq(vault.dailyWithdrawals(address(0), day2), 1 ether);
+        assertEq(vault.dailyWithdrawals(address(0), day1), 1 ether); // Day 1 unchanged
+    }
+
+    function test_DailyLimit_MAX_VALUE_NoLimit() public {
+        // Set daily limit to MAX_VALUE (no limit)
+        vm.prank(admin);
+        vault.setDailyLimit(address(0), type(uint256).max);
+
+        // Seed funds
+        bytes32 pid = _uuid("daily-limit-max");
+        _fundEth(alice, 10 ether);
+        vm.prank(alice);
+        (bool ok,) = vault.walletAddress(pid).call{value: 10 ether}("");
+        assertTrue(ok);
+        vault.sweep(pid, address(0), alice);
+
+        address beneficiary = bob;
+        uint256 nonce = vault.nonces(beneficiary);
+        uint256 deadline = block.timestamp + 1 days;
+
+        // Should be able to withdraw all funds in one go
+        bytes memory sig = _signWithdraw(beneficiary, address(0), 10 ether, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(0), 10 ether, deadline, sig);
+        assertEq(beneficiary.balance, 10 ether);
+
+        // Daily withdrawals should still be 0 (not tracked when limit is MAX_VALUE)
+        assertEq(vault.dailyWithdrawals(address(0), block.timestamp / 1 days), 0);
+    }
+
+    function test_DailyLimit_EventEmitted() public {
+        vm.expectEmit(true, true, true, true);
+        emit DailyLimitSet(address(tokenA), 1000e18);
+
+        vm.prank(admin);
+        vault.setDailyLimit(address(tokenA), 1000e18);
+    }
+
+    function test_DailyLimit_MultipleTokens_Independent() public {
+        // Set different limits for different tokens
+        vm.prank(admin);
+        vault.setDailyLimit(address(0), 2 ether);
+        vm.prank(admin);
+        vault.setDailyLimit(address(tokenA), 1000e18);
+
+        // Seed ETH
+        bytes32 pid1 = _uuid("daily-limit-multi-eth");
+        _fundEth(alice, 3 ether);
+        vm.prank(alice);
+        (bool ok,) = vault.walletAddress(pid1).call{value: 3 ether}("");
+        assertTrue(ok);
+        vault.sweep(pid1, address(0), alice);
+
+        // Seed tokenA
+        bytes32 pid2 = _uuid("daily-limit-multi-token");
+        tokenA.mint(vault.walletAddress(pid2), 2000e18);
+        vault.sweep(pid2, address(tokenA), alice);
+
+        // Withdraw ETH up to limit
+        address beneficiary = bob;
+        uint256 nonce = vault.nonces(beneficiary);
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory sigEth = _signWithdraw(beneficiary, address(0), 2 ether, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(0), 2 ether, deadline, sigEth);
+        assertEq(beneficiary.balance, 2 ether);
+
+        // Withdraw tokenA up to limit (should work independently)
+        nonce = vault.nonces(beneficiary);
+        bytes memory sigToken = _signWithdraw(beneficiary, address(tokenA), 1000e18, nonce, deadline);
+        vault.withdrawWithIntent(beneficiary, address(tokenA), 1000e18, deadline, sigToken);
+        assertEq(tokenA.balanceOf(beneficiary), 1000e18);
+
+        // Verify limits are tracked independently
+        uint256 currentDay = block.timestamp / 1 days;
+        assertEq(vault.dailyWithdrawals(address(0), currentDay), 2 ether);
+        assertEq(vault.dailyWithdrawals(address(tokenA), currentDay), 1000e18);
+    }
+
+    // Helper to define the event for expectEmit
+    event DailyLimitSet(address indexed token, uint256 limit);
 }

@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 /**
  * @title Receiver
- * @dev Mock receiver for adminCall/adminTransfer tests
+ * @dev Mock receiver for adminTransfer tests
  */
 contract Receiver {
     uint256 public x;
