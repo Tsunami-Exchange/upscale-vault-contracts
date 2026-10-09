@@ -99,13 +99,6 @@ contract PayInvoiceVaultScript is Script {
             }
         }
         
-        // Check payment-specific balance
-        try vault.byPayment(paymentId, tokenAddress) returns (uint256 paymentBalance) {
-            console2.log("Current Payment Balance:", paymentBalance);
-        } catch {
-            console2.log("Current Payment Balance: Unable to fetch");
-        }
-        
         vm.startBroadcast(payerKey);
         
         console2.log("\n=== Executing Vault Payment ===");
@@ -159,14 +152,6 @@ contract PayInvoiceVaultScript is Script {
             } catch {
                 console2.log("Vault New Tracked Tokens: Unable to fetch");
             }
-        }
-        
-        // Check payment-specific balance
-        try vault.byPayment(paymentId, tokenAddress) returns (uint256 newPaymentBalance) {
-            console2.log("New Payment Balance:", newPaymentBalance);
-            console2.log("Payment Recorded:", newPaymentBalance >= amount ? "YES" : "PARTIAL/NO");
-        } catch {
-            console2.log("New Payment Balance: Unable to fetch");
         }
         
         console2.log("\n=== Summary ===");

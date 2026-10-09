@@ -11,11 +11,11 @@ interface IDeterministicVault {
      */
     event WhitelistSet(address indexed token, bool allowed);
     event IntentSignerSet(address indexed signer);
+    event DailyLimitSet(address indexed token, uint256 limit);
     event Deposited(bytes32 indexed paymentId, address indexed payer, address indexed token, uint256 amount);
     event DirectPayment(bytes32 indexed paymentId, address indexed payer, address indexed token, uint256 amount);
     event Swept(bytes32 indexed paymentId, address wallet, address indexed token, uint256 nativeAmt, uint256 tokenAmt);
     event Withdrawn(address indexed to, address indexed token, uint256 amount, uint256 nonce);
-    event DirectWithdraw(address indexed signer, address indexed beneficiary, address indexed token, uint256 amount);
     event AdminTransfer(address indexed token, address indexed to, uint256 amount);
 
     /**
@@ -25,6 +25,11 @@ interface IDeterministicVault {
     function walletAddress(bytes32 paymentId) external view returns (address);
     function walletAddressFromUuid(string calldata uuid) external view returns (address);
     function sweep(bytes32 paymentId, address token, address payer) external returns (address wallet);
+    function sweepBatch(
+        bytes32[] calldata paymentIds,
+        address[] calldata tokens,
+        address[] calldata payers
+    ) external returns (address[] memory wallets);
     function payDirect(bytes32 paymentId, address token, uint256 amount) external payable;
     function payDirectWithPermit(
         bytes32 paymentId,
@@ -35,22 +40,36 @@ interface IDeterministicVault {
         bytes32 r,
         bytes32 s
     ) external;
+    function payDirectWithTransferAuthorization(
+        bytes32 paymentId,
+        address token,
+        uint256 amount,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
 
     /**
      * @dev Configuration functions
      */
     function setWhitelist(address token, bool allowed) external;
     function setIntentSigner(address signer) external;
+    function setDailyLimit(address token, uint256 limit) external;
 
     /**
      * @dev State query functions
      */
     function tokenWhitelist(address token) external view returns (bool);
     function totalBalances(address token) external view returns (uint256);
-    function byPayment(bytes32 paymentId, address token) external view returns (uint256);
     function intentSigner() external view returns (address);
     function nonces(address beneficiary) external view returns (uint256);
     function domainSeparator() external view returns (bytes32);
+    function dailyLimits(address token) external view returns (uint256);
+    function dailyLimitSet(address token) external view returns (bool);
+    function dailyWithdrawals(address token, uint256 day) external view returns (uint256);
 
     /**
      * @dev Sweep functionality
@@ -77,5 +96,4 @@ interface IDeterministicVault {
         uint256 deadline,
         bytes calldata signature
     ) external;
-    function withdrawDirect(address beneficiary, address token, uint256 amount) external;
 }
